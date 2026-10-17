@@ -1,0 +1,19 @@
+name: Unpack upload
+on:
+  push:
+    paths: ["upload.zip"]
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          unzip -o upload.zip
+          git rm -q upload.zip
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Unpack upload"
+          git push
