@@ -1,0 +1,55 @@
+{
+  "name": "@media-dashboard/brand-connector",
+  "version": "1.0.0",
+  "description": "Runs on a brand's own website: affiliate click tracking, checkout/order attribution, sales stats and the sales screen drawn over the media dashboard iframe. No activity data ever leaves the brand.",
+  "type": "module",
+  "main": "./dist/server/index.js",
+  "types": "./dist/server/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server/index.d.ts",
+      "default": "./dist/server/index.js"
+    },
+    "./host": {
+      "types": "./dist/host/index.d.ts",
+      "default": "./dist/host/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "default": "./dist/react.js"
+    },
+    "./sql/schema.sql": "./sql/schema.sql",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "sql",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "node --test dist/test"
+  },
+  "peerDependencies": {
+    "pg": ">=8",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": ">=20",
+    "@types/react": ">=18",
+    "typescript": ">=5.6"
+  }
+}

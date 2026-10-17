@@ -1,0 +1,27 @@
+{
+  "name": "media-platform-connector",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p connector && next build",
+    "dev": "tsc -p connector && next dev -p 4200",
+    "start": "next start -p 4200",
+    "test": "tsc -p connector && node --test connector/dist/test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@media-dashboard/brand-connector": "file:./connector",
+    "next": "16.3.2",
+    "pg": "^8.13.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "@types/pg": "^8.11.0",
+    "@types/react": "19.2.18",
+    "typescript": "7.0.2"
+  }
+}
