@@ -4,8 +4,8 @@ Your brand's own app for the Media Platform. It runs in **your** Vercel account 
 
 ## Set up
 
-1. **Get your Supabase address**: in your Supabase project click **Connect** → **Transaction pooler** → copy the URI, and put your database password in place of `[YOUR-PASSWORD]`.
-2. **Deploy** with the button on the Media Platform's Integration page. Fill in the values it shows (`MEDIA_PLATFORM_URL`, `BRAND`, `BRAND_NAME`, `SITE_URL`, `OWNER_KEY`) and `SUPABASE_DB_URL` (the address from step 1).
+1. **Deploy** with the button on the Media Platform's Integration page. Fill in the values it shows (`MEDIA_PLATFORM_URL`, `BRAND`, `BRAND_NAME`, `SITE_URL`, `OWNER_KEY`).
+2. **Link your Supabase**: in your Supabase project, **Project Settings → Integrations → Vercel** → connect it to this Vercel project → in Vercel, **Redeploy**. (Or set `SUPABASE_DB_URL` by hand to your Supabase **Connect → Transaction pooler** address, with your password in it.)
 3. Open this app's address, sign in with your `OWNER_KEY`, and follow the setup page: paste your connect code, give Claude Code the short website prompt, and connect Shopify. Every step shows a tick when it works.
 
 Owners and creators then use `https://<your site>/media`.

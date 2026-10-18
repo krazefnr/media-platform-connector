@@ -12,18 +12,16 @@ const page = (title: string, body: string) =>
     { status: 503, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } }
   );
 
-const HOW_TO = `<ol>
-<li>In your Supabase project: <strong>Connect</strong> (top of the page) → <strong>Transaction pooler</strong> → copy the URI.</li>
-<li>Put your database password in place of <code>[YOUR-PASSWORD]</code>. (Forgot it? <strong>Project Settings → Database → Reset database password</strong>.)</li>
-<li>In Vercel: this project → <strong>Settings → Environment Variables</strong> → set <code>SUPABASE_DB_URL</code> to it → <strong>Deployments → Redeploy</strong>.</li>
-</ol><p>This app makes its own <code>md_</code> tables in your Supabase and locks them so your website's public Supabase key can't read them.</p>`;
+const HOW_TO = `<p><strong>Easiest:</strong> in your Supabase project go to <strong>Project Settings → Integrations → Vercel</strong>, connect it to this Vercel project, then in Vercel: <strong>Deployments → Redeploy</strong>. That fills in the database address for you.</p>
+<p><strong>Or by hand:</strong> in Supabase click <strong>Connect</strong> → <strong>Transaction pooler</strong> → copy the address, put your database password in place of <code>[YOUR-PASSWORD]</code>, and save it in Vercel (<strong>Settings → Environment Variables</strong>) as <code>SUPABASE_DB_URL</code>, then Redeploy.</p>
+<p>This app makes its own <code>md_</code> tables in your Supabase and locks them so your website's public Supabase key can't read them.</p>`;
 
 const LOCAL = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /** Supabase only (any local Postgres is allowed for testing). Returns a page explaining what's wrong, or null. */
 function checkUrl(url: string | undefined): Response | null {
   if (!url) return page("Connect your Supabase", `<p>This app keeps its data in your own Supabase.</p>${HOW_TO}`);
-  if (url.includes("[YOUR-PASSWORD]")) return page("Add your password", `<p><code>SUPABASE_DB_URL</code> still says <code>[YOUR-PASSWORD]</code>.</p>${HOW_TO}`);
+  if (url.includes("[YOUR-PASSWORD]")) return page("Add your password", `<p>Your database address still says <code>[YOUR-PASSWORD]</code>.</p>${HOW_TO}`);
   let host: string;
   try {
     host = new URL(url).hostname;
@@ -31,7 +29,7 @@ function checkUrl(url: string | undefined): Response | null {
     return page("That database address doesn't look right", `<p>If your password has symbols like <code>@ # / ?</code>, reset it to one with only letters and numbers.</p>${HOW_TO}`);
   }
   if (LOCAL.has(host)) return null;
-  if (!/\.supabase\.(co|com)$/.test(host)) return page("Use your Supabase", `<p><code>SUPABASE_DB_URL</code> must be your Supabase project's address.</p>${HOW_TO}`);
+  if (!/\.supabase\.(co|com)$/.test(host)) return page("Use your Supabase", `<p>The database address must be your Supabase project's.</p>${HOW_TO}`);
   if (/^db\./.test(host)) return page("Use the pooler address", `<p>Vercel can't reach Supabase's direct address. Copy the <strong>Transaction pooler</strong> one instead.</p>${HOW_TO}`);
   return null;
 }
@@ -50,13 +48,15 @@ function dbProblem(error: unknown): Response {
 /** One app per server instance: its own database pool, built from this project's environment variables. */
 export function getApp(): ConnectorApp {
   if (app) return app;
-  const url = process.env.SUPABASE_DB_URL?.trim();
+  // SUPABASE_DB_URL by hand, or POSTGRES_URL from Supabase's Vercel integration (its transaction pooler address).
+  const url = (process.env.SUPABASE_DB_URL || process.env.POSTGRES_URL)?.trim();
   const problem = checkUrl(url);
   if (problem) return { handle: async () => problem.clone() };
   const parsed = new URL(url!);
   const local = LOCAL.has(parsed.hostname);
   // Supabase's certificate isn't in Node's default trust list; the link is still encrypted.
   parsed.searchParams.delete("sslmode");
+  parsed.searchParams.delete("supa");
   const pool = new pg.Pool({
     connectionString: parsed.toString(),
     ssl: local ? undefined : { rejectUnauthorized: false },
