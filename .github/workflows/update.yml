@@ -1,0 +1,19 @@
+name: Update from Media Platform
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git clone --depth 1 https://github.com/krazefnr/media-platform-connector /tmp/latest
+          rsync -a --delete --exclude .git --exclude .github /tmp/latest/ ./
+          git add -A
+          if git diff --cached --quiet; then echo "Already up to date."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update from Media Platform"
+          git push
