@@ -1,4 +1,4 @@
-import { createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
+import { createHmac, createPublicKey, generateKeyPairSync, randomBytes, sign, timingSafeEqual, type KeyObject } from "node:crypto";
 import { APP_SERVICE_BY_ID, validateService, type SavedServices } from "./app-services.js";
 import { ConfigUnavailableError } from "./config.js";
 import { createConnector, type Connector, type ConnectorOptions } from "./connector.js";
@@ -197,7 +197,7 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
       waitUntil: options.waitUntil,
       access: { ownerKey: e.ownerKey, ownerName: `${e.brandName} owner` },
       reportStatus: () => checksState,
-      installedTools: s("shopify") ? ["shopify"] : [],
+      installedTools: [...(s("shopify") ? ["shopify"] : []), ...(s("custom_checkout") ? ["custom_checkout"] : [])],
       tags: {
         clarity: s("clarity")?.projectId,
         tiktok: s("tiktok")?.pixelCode,
@@ -300,6 +300,79 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
     return new Response("ok");
   }
 
+  /**
+   * Any processor, gateway or worker reports here (the "Other checkout" service). The raw body is signed:
+   * header x-md-signature = hex HMAC-SHA256 of the body, keyed with the secret from the setup page.
+   */
+  async function handleCheckoutEvent(request: Request): Promise<Response> {
+    const c = await load(request);
+    const secret = c.services.custom_checkout?.secret;
+    const raw = await request.text();
+    if (raw.length > 64_000) return json(413, { error: "too_large" });
+    const given = Buffer.from(request.headers.get("x-md-signature") ?? "", "hex");
+    const expected = secret ? createHmac("sha256", secret).update(raw).digest() : null;
+    if (!expected || given.length !== expected.length || !timingSafeEqual(given, expected)) return json(401, { error: "bad_signature" });
+    let b: Record<string, unknown>;
+    try {
+      b = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return json(400, { error: "invalid_json" });
+    }
+    const type = typeof b.type === "string" ? b.type : "";
+    const email = cleanText(b.email, 254)?.toLowerCase() ?? null;
+    const customer = email ? { email } : null;
+    const test = b.test === true;
+    const code = cleanText(b.code, 64);
+    const money = (v: unknown) => (typeof v === "number" || typeof v === "string" ? v : 0);
+    try {
+      if (type === "checkout") {
+        await c.connector.recordCheckout({
+          checkoutId: String(b.checkout_id ?? ""),
+          cartTotal: money(b.amount),
+          currency: cleanText(b.currency, 3) ?? "GBP",
+          customer,
+          code,
+          test,
+          step: cleanText(b.step, 40),
+          recoveryUrl: sameOriginUrl(b.recovery_url),
+        });
+      } else if (type === "paid") {
+        await c.connector.recordOrder({
+          orderId: String(b.order_id ?? ""),
+          checkoutId: cleanText(b.checkout_id, 200),
+          amount: money(b.amount),
+          currency: cleanText(b.currency, 3) ?? "GBP",
+          customer,
+          code,
+          test,
+        });
+      } else if (type === "failed") {
+        await c.connector.recordCheckoutFailed({ checkoutId: String(b.checkout_id ?? ""), reason: cleanText(b.reason, 200) });
+      } else if (type === "refunded") {
+        await c.connector.recordRefund({ orderId: String(b.order_id ?? "") });
+      } else {
+        return json(400, { error: "unknown_type", types: ["checkout", "paid", "failed", "refunded"] });
+      }
+    } catch (error) {
+      if (error instanceof ValidationError) return json(400, { error: "invalid_request", detail: error.message });
+      if (error instanceof ConfigUnavailableError) return json(503, { error: "not_ready" });
+      throw error;
+    }
+    beat(`custom:${type}`);
+    return json(200, { ok: true });
+  }
+
+  /** Recovery links must point at the brand's own site. */
+  function sameOriginUrl(value: unknown): string | null {
+    const v = cleanText(value, 2000);
+    if (!v) return null;
+    try {
+      return new URL(v).origin === env!.siteOrigin ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
   const cors = { "access-control-allow-origin": "*", "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type" };
 
   async function handleStep(request: Request): Promise<Response> {
@@ -320,8 +393,9 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
     if (!sameSite(request, c)) return json(403, { error: "forbidden_origin" });
     if (!startedLimiter.take("site", now().getTime())) return json(429, { error: "rate_limited" });
     const shop = c.services.shopify;
-    if (!shop) return json(503, { error: "shopify_not_set_up" });
     const body = await readJson(request, 2048);
+    if (!shop && c.services.custom_checkout) return customCheckoutStarted(request, c, body);
+    if (!shop) return json(503, { error: "shopify_not_set_up" });
     const email = cleanText(body?.email, 254)?.toLowerCase() ?? "";
     const cartId = cleanText(body?.cart_id, 300) ?? "";
     const token = shopifyCartToken(cartId);
@@ -356,6 +430,37 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
       if (error instanceof ConfigUnavailableError) return json(503, { error: "not_ready" });
       throw error;
     }
+  }
+
+  /** "Other checkout": the site's own cart id is the checkout id, and the processor reports "paid" with the same id. */
+  async function customCheckoutStarted(
+    request: Request,
+    c: Awaited<ReturnType<typeof load>>,
+    body: Record<string, unknown> | null
+  ): Promise<Response> {
+    const email = cleanText(body?.email, 254)?.toLowerCase() ?? "";
+    const cartId = cleanText(body?.cart_id, 200) ?? "";
+    if (!/^[^\s@<>]{1,64}@[^\s@<>]{1,190}\.[a-z]{2,}$/i.test(email) || !/^[\w:./=?&-]{1,200}$/.test(cartId)) {
+      return json(400, { error: "invalid_request" });
+    }
+    try {
+      await c.connector.recordCheckout({
+        checkoutId: cartId,
+        clickId: c.connector.clickIdFromRequest(request),
+        visitorId: c.connector.visitorIdFromRequest(request),
+        cartTotal: typeof body?.total === "number" || typeof body?.total === "string" ? body.total : 0,
+        currency: cleanText(body?.currency, 3) ?? "GBP",
+        customer: { ...c.connector.browserContext(request), email, firstName: cleanText(body?.first_name, 80) },
+        recoveryUrl: sameOriginUrl(body?.recovery_url),
+        step: "email",
+      });
+    } catch (error) {
+      if (error instanceof ValidationError) return json(400, { error: "invalid_request" });
+      if (error instanceof ConfigUnavailableError) return json(503, { error: "not_ready" });
+      throw error;
+    }
+    beat("checkout_started");
+    return json(200, { ok: true });
   }
 
   // ---- Setup ----------------------------------------------------------------
@@ -437,25 +542,42 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
         ? { id: "tracker", label: "Tracker on your pages", state: "ok", detail: "Visits are being recorded." }
         : { id: "tracker", label: "Tracker on your pages", state: "warn", detail: "No visits seen yet. Add the script tag (step 2), then open your site once." }
     );
+    // Shopify's own checkout webhooks carry the email too, so emails keep arriving without the site's line.
+    const shopifyCheckouts = seen("shopify:checkouts/create", 14 * DAY) || seen("custom:checkout", 14 * DAY) || seen("custom:paid", 14 * DAY);
     add(
-      seen("checkout_started")
+      seen("checkout_started", 14 * DAY)
         ? { id: "checkout_email", label: "Email step", state: "ok", detail: "Shopper emails are being logged." }
-        : { id: "checkout_email", label: "Email step", state: "warn", detail: "No checkout started yet. Add the checkoutStarted line (step 2), then start a test checkout." }
+        : seen("checkout_started") && shopifyCheckouts
+          ? { id: "checkout_email", label: "Email step", state: "warn", detail: "Your website stopped sending the email step (did the checkout change?). Emails typed on Shopify's checkout still arrive. To log them earlier again, give Claude Code the website prompt (step 2) once more." }
+          : shopifyCheckouts
+            ? { id: "checkout_email", label: "Email step", state: "ok", detail: "Emails arrive from Shopify's checkout. Your site has no email step before it, which is fine." }
+            : { id: "checkout_email", label: "Email step", state: "warn", detail: "No checkout started yet. Add the checkoutStarted line (step 2), then start a test checkout." }
     );
-    const shop = c.services.shopify;
-    const webhooks = ["checkouts/create", "orders/paid"].filter((t) => seen(`shopify:${t}`));
-    add(
-      !shop
-        ? { id: "shopify", label: "Shopify", state: "fail", detail: "Add your Shopify details in step 3." }
-        : webhooks.length === 2
-          ? { id: "shopify", label: "Shopify", state: "ok", detail: "Checkouts and paid orders are arriving." }
-          : { id: "shopify", label: "Shopify", state: "warn", detail: `Waiting for Shopify: ${["checkouts/create", "orders/paid"].filter((t) => !webhooks.includes(t)).join(" and ")} not received yet. Create the webhooks in step 3, then place a test order.` }
-    );
-    add(
-      seen("pixel")
-        ? { id: "shopify_pixel", label: "Checkout steps pixel", state: "ok", detail: "Checkout steps are arriving." }
-        : { id: "shopify_pixel", label: "Checkout steps pixel", state: "warn", detail: "No checkout steps yet. Add the custom pixel in step 3." }
-    );
+    if (c.services.custom_checkout && !c.services.shopify) {
+      const processor = c.services.custom_checkout.processor ?? "your checkout";
+      add(
+        seen("custom:paid")
+          ? { id: "custom_checkout", label: "Checkout", state: "ok", detail: `Paid orders are arriving from ${processor}.` }
+          : seen("custom:checkout") || seen("checkout_started")
+            ? { id: "custom_checkout", label: "Checkout", state: "warn", detail: `Checkouts are arriving. Waiting for the first paid order from ${processor} (place a test order).` }
+            : { id: "custom_checkout", label: "Checkout", state: "warn", detail: `Nothing from ${processor} yet. Give your AI the checkout prompt in step 3, then place a test order.` }
+      );
+    } else {
+      const shop = c.services.shopify;
+      const webhooks = ["checkouts/create", "orders/paid"].filter((t) => seen(`shopify:${t}`));
+      add(
+        !shop
+          ? { id: "shopify", label: "Shopify", state: "fail", detail: "Add your Shopify details in step 3." }
+          : webhooks.length === 2
+            ? { id: "shopify", label: "Shopify", state: "ok", detail: "Checkouts and paid orders are arriving." }
+            : { id: "shopify", label: "Shopify", state: "warn", detail: `Waiting for Shopify: ${["checkouts/create", "orders/paid"].filter((t) => !webhooks.includes(t)).join(" and ")} not received yet. Create the webhooks in step 3, then place a test order.` }
+      );
+      add(
+        seen("pixel")
+          ? { id: "shopify_pixel", label: "Checkout steps pixel", state: "ok", detail: "Checkout steps are arriving." }
+          : { id: "shopify_pixel", label: "Checkout steps pixel", state: "warn", detail: "No checkout steps yet. Add the custom pixel in step 3." }
+      );
+    }
     add(
       seen("tasks", 6 * 3600_000)
         ? { id: "tasks", label: "Background tasks", state: "ok", detail: "Running." }
@@ -513,6 +635,15 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
       } else {
         const valid = validateService(id, body.values);
         if (!valid.ok) return json(400, { error: valid.error });
+        if (id === "custom_checkout") {
+          // A new checkout gets a new secret, so the old one can no longer report sales.
+          const before = c.services.custom_checkout;
+          const same = before?.secret && before.kind === valid.values.kind && before.processor === valid.values.processor;
+          valid.values.secret = same ? before.secret! : `mdcs_${randomBytes(24).toString("base64url")}`;
+        }
+        // One checkout at a time: picking Shopify or another one switches over.
+        if (id === "custom_checkout") await store.setSetting("svc:shopify", null, now());
+        if (id === "shopify") await store.setSetting("svc:custom_checkout", null, now());
         await store.setSetting(`svc:${id}`, valid.values, now());
       }
       await load(request, true);
@@ -535,6 +666,7 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
     }
     if (path === "/api/md/shopify/webhook" && request.method === "POST") return handleShopifyWebhook(request);
     if (path === "/api/md/shopify/step") return handleStep(request);
+    if (path === "/api/md/checkout/event" && request.method === "POST") return handleCheckoutEvent(request);
     if (path === "/api/md/checkout-started" && request.method === "POST") return handleCheckoutStarted(request);
     const c = await load(request);
     if (path === "/media") {
@@ -557,6 +689,10 @@ export function createConnectorApp(options: ConnectorAppOptions): ConnectorApp {
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
         if (message === "not_configured") return json(503, { error: "not_configured", missing });
+        const path = new URL(request.url).pathname;
+        console.error("[connector]", path, error);
+        // The owner's own setup page says what broke, so a failed first start can be fixed without reading logs.
+        if (path === "/") return json(500, { error: "internal_error", detail: message.slice(0, 300) });
         return json(500, { error: "internal_error" });
       }
     },

@@ -98,7 +98,15 @@ export function trackerScript(options: { refParam: string; mountPath: string; co
     var data = input || {};
     if (!data.email || !data.cartId || !window.fetch) return Promise.resolve(false);
     clarity("set", "md_checkout_step", "email");
-    var done = post("/checkout-started", { email: String(data.email).slice(0, 254), cart_id: String(data.cartId).slice(0, 300), first_name: data.firstName ? String(data.firstName).slice(0, 80) : undefined })
+    var done = post("/checkout-started", {
+      email: String(data.email).slice(0, 254),
+      cart_id: String(data.cartId).slice(0, 300),
+      first_name: data.firstName ? String(data.firstName).slice(0, 80) : undefined,
+      // Only used without Shopify (the "Other checkout" service), where the cart can't be looked up.
+      total: data.total != null ? String(data.total).slice(0, 20) : undefined,
+      currency: data.currency ? String(data.currency).slice(0, 3) : undefined,
+      recovery_url: data.recoveryUrl ? String(data.recoveryUrl).slice(0, 2000) : undefined
+    })
       .then(function () { return true; }, function () { return false; });
     return Promise.race([done, new Promise(function (r) { setTimeout(function () { r(false); }, 1500); })]);
   };

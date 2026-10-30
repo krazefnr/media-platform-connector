@@ -49,6 +49,12 @@ summary .muted{font-weight:400}
 .pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid var(--line)}
 ol{margin:0;padding-left:20px;display:grid;gap:4px}
 code{background:var(--code);border-radius:4px;padding:0 4px;font-size:.9em}
+.opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.opt{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:10px 12px;cursor:pointer;font-size:14px;font-weight:400}
+.opt:has(input:checked){border-color:var(--ok);box-shadow:0 0 0 1px var(--ok) inset}
+.opt input{width:auto;margin-top:4px}
+.tag{font-size:11px;font-weight:700;color:var(--ok)}
+[hidden]{display:none!important}
 `;
 
 const SCRIPT = `
@@ -58,6 +64,12 @@ const post = async (path, body) => {
   const data = await r.json().catch(() => ({}));
   return r.ok ? { ok: true } : { ok: false, error: data.error || ("Error " + r.status) };
 };
+const showPanel = () => {
+  const picked = document.querySelector('input[name="checkoutKind"]:checked');
+  document.querySelectorAll("[data-panel]").forEach((p) => (p.hidden = !picked || p.dataset.panel !== picked.value));
+};
+document.querySelectorAll('input[name="checkoutKind"]').forEach((r) => r.addEventListener("change", showPanel));
+showPanel();
 document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", async () => {
   const text = document.getElementById(b.dataset.copy).textContent;
   try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; } catch { b.textContent = "Select and copy (Ctrl+C)"; }
@@ -104,7 +116,54 @@ function serviceForm(service: AppService, saved: Record<string, string> | undefi
   </form>`;
 }
 
-export function sitePrompt(connectorOrigin: string): string {
+/** Step 3 of the website prompt, for Shopify or for any other checkout. */
+function emailStep(custom: boolean): string {
+  if (!custom) {
+    return `3. Email step. Find the site's EXISTING step where the shopper types their email before being sent to Shopify's checkout. Keep it exactly as it is (don't add a second email box, and don't change how the email is passed to Shopify). If there's no such step, skip this edit and tell me: don't build one (emails typed on Shopify's checkout still reach the connector). In the browser, right before redirecting to the Shopify checkout URL, add:
+   await window.MediaDashboard?.checkoutStarted({ email, cartId });
+   email = what they typed, cartId = the Shopify Storefront cart id (gid://shopify/Cart/...). It finishes within 1.5 seconds and never throws, so it can't block a sale. Add a TypeScript declaration for window.MediaDashboard if needed.`;
+  }
+  return `3. Email step. Find the site's EXISTING step where the shopper types their email before being sent to payment. Keep it exactly as it is (don't add a second email box, and don't change how payment works). If there's no such step, skip this edit and tell me: don't build one. In the browser, right before sending the shopper to the payment page, add:
+   await window.MediaDashboard?.checkoutStarted({ email, cartId, total, currency, recoveryUrl });
+   email = what they typed; cartId = the site's own cart or checkout id, the SAME id the payment step passes to the processor (it comes back as checkout_id in the "paid" event); total = the cart total in major units (49.99); currency = e.g. "GBP"; recoveryUrl = optional link on this site that reopens the cart. It finishes within 1.5 seconds and never throws, so it can't block a sale. Add a TypeScript declaration for window.MediaDashboard if needed.`;
+}
+
+/** For Stripe or a non-KYC gateway: what their payment webhook handler sends to this app. */
+export function checkoutPrompt(kind: string, processor: string, connectorOrigin: string, secret: string): string {
+  const stripe = kind === "stripe";
+  const where = stripe
+    ? `Our payments go through Stripe. Find the site's server-side Stripe webhook handler (it already handles checkout.session.completed or payment_intent.succeeded). If there isn't one, tell me before adding one.`
+    : `Our payments go through a non-KYC card-to-crypto processor behind the ${processor} payment gateway. Find the site's server-side code that receives ${processor}'s webhooks (its "order paid / completed" event; it may be an API route or a Cloudflare Worker). Keep verifying ${processor}'s own webhook signature exactly as it does now. If there's no webhook handler, tell me before adding one. ${processor}'s API key stays where it already is (the site's own environment variables): this app doesn't need it.`;
+  const passId = stripe
+    ? `When the site creates the Stripe Checkout Session (or PaymentIntent), set client_reference_id (or metadata.md_cart) to the site's cart id, the same one passed to window.MediaDashboard.checkoutStarted({ cartId }). That's how a sale is credited to the right creator.`
+    : `When the site creates the ${processor} order or invoice through its API, put the site's cart id in its custom fields / metadata (whatever ${processor} returns in the webhook), the same id passed to window.MediaDashboard.checkoutStarted({ cartId }). That's how a sale is credited to the right creator.`;
+  const events = stripe
+    ? `   - checkout.session.completed (or payment_intent.succeeded) -> {"type":"paid","order_id":"<payment_intent id>","checkout_id":"<client_reference_id>","amount":<amount_total / 100>,"currency":"<currency, upper case>","email":"<customer_details.email>","code":"<promotion code, if any>","test":<true when livemode is false>}
+   - charge.refunded (fully refunded) -> {"type":"refunded","order_id":"<payment_intent id>"}
+   - Optional: checkout.session.expired -> {"type":"failed","checkout_id":"<client_reference_id>","reason":"expired"}`
+    : `   - Order paid / completed -> {"type":"paid","order_id":"<${processor}'s order id>","checkout_id":"<the cart id from its custom fields>","amount":<what the shopper paid, in the shop's currency like 49.99, NOT the crypto amount>,"currency":"GBP","email":"<customer email>","code":"<coupon, if any>","test":<true for test orders>}
+   - Refunded -> {"type":"refunded","order_id":"<same order id>"}
+   - Optional: order cancelled / expired / payment failed -> {"type":"failed","checkout_id":"<cart id>","reason":"<short reason>"}`;
+  return `${where} Connect it to our Media Platform connector app. Don't change how payments work.
+
+1. Save this as a server-side environment variable named MD_CHECKOUT_SECRET (never in browser code, never committed to git):
+   ${secret}
+
+2. After the webhook handler has handled an event, send a POST to:
+   ${connectorOrigin}/api/md/checkout/event
+   Headers: content-type: application/json, and x-md-signature = the hex HMAC-SHA256 of the exact raw JSON body, keyed with MD_CHECKOUT_SECRET.
+   Use a 5-second timeout and never let this call fail or delay the payment flow: log errors and carry on. Retrying is safe: the same order_id is only counted once.
+
+3. What to send:
+${events}
+
+4. ${passId}
+
+If an older payment setup also reports to this app, leave it until this one works, then remove it.
+Commit and deploy. Then place one test order and tell me to open ${connectorOrigin}/ and press "Check again".`;
+}
+
+export function sitePrompt(connectorOrigin: string, custom = false): string {
   return `Connect this website to our Media Platform connector app. It's 3 small changes. Don't change anything else, and don't add any other Media Platform code: the connector app does the rest.
 
 1. Rewrites. In next.config (js, mjs or ts), add these to async rewrites() (merge with any that exist):
@@ -115,9 +174,7 @@ export function sitePrompt(connectorOrigin: string): string {
 2. Tracker. In the root layout (app/layout.tsx), inside <body>, add:
    <Script src="/api/md/t.js" strategy="afterInteractive" />   (import Script from "next/script")
 
-3. Email step. Find where the shopper types their email before being sent to Shopify's checkout. In the browser, right before redirecting to the Shopify checkout URL, add:
-   await window.MediaDashboard?.checkoutStarted({ email, cartId });
-   email = what they typed, cartId = the Shopify Storefront cart id (gid://shopify/Cart/...). It finishes within 1.5 seconds and never throws, so it can't block a sale. Add a TypeScript declaration for window.MediaDashboard if needed.
+${emailStep(custom)}
 
 Optional, recommended: on product pages call window.MediaDashboard?.track("view_item", { id, name, price, currency }) once, and window.MediaDashboard?.track("add_to_cart", { id, name, price, currency, quantity }) when something is added (id = variant SKU or id).
 Optional: add a "Creators" link to /media in the footer.
@@ -166,6 +223,40 @@ export function setupPage(input: SetupInput): string {
   const failing = list.filter((c) => c.state !== "ok").length;
   const optional = APP_SERVICES.filter((s) => s.optional);
   const shopify = APP_SERVICES.find((s) => s.id === "shopify")!;
+  const custom = services.custom_checkout;
+  const usesCustom = !!custom && !services.shopify;
+  const current = services.shopify ? "shopify" : custom?.kind === "stripe" ? "stripe" : custom?.kind === "gateway" ? "gateway" : "";
+  const promptFor = (kind: string) =>
+    custom?.secret && custom.kind === kind
+      ? `<p class="muted">Paste this into Claude Code (or your AI) in your website's project. It includes your signing secret, so only give it to your own AI.</p>
+      <pre id="checkoutPrompt-${kind}">${esc(checkoutPrompt(kind, custom.processor ?? "", connectorOrigin, custom.secret))}</pre>
+      <div class="row"><button class="ghost" data-copy="checkoutPrompt-${kind}" type="button">Copy prompt</button></div>
+      ${checks(list, ["custom_checkout"])}`
+      : "";
+  const choice = (kind: string, title: string, sub: string) =>
+    `<label class="opt"><input type="radio" name="checkoutKind" value="${kind}"${(current || "shopify") === kind ? " checked" : ""}><span><b>${title}</b>${current === kind ? ' <span class="tag">CURRENT</span>' : ""}<br><span class="muted">${sub}</span></span></label>`;
+  const shopifyPanel = `<ol>
+        <li>Shopify admin → Settings → Notifications → Webhooks → <strong>Create webhook</strong> four times, format JSON, latest API version, URL:<pre id="hookUrl">${esc(connectorOrigin)}/api/md/shopify/webhook</pre>Events: <strong>Checkout creation</strong>, <strong>Checkout update</strong>, <strong>Order payment</strong>, <strong>Order update</strong>.</li>
+        <li>Shopify admin → Settings → Customer events → <strong>Add custom pixel</strong> → name it "Media Platform", paste this code, set Permission to "Not required", Save, then Connect:<pre id="pixel">${esc(pixelCode(connectorOrigin))}</pre><button class="ghost" data-copy="pixel" type="button">Copy pixel code</button></li>
+        <li>Fill in below.</li>
+      </ol>
+      ${serviceForm(shopify, services.shopify)}
+      ${current === "shopify" ? checks(list, ["shopify", "shopify_pixel"]) : ""}`;
+  const stripePanel = `<form class="grid" data-action="service" data-service="custom_checkout">
+        <input type="hidden" name="kind" value="stripe"><input type="hidden" name="processor" value="Stripe">
+        <p class="muted">Uses your site's existing Stripe webhook. No Stripe keys go in this app.</p>
+        <p class="err" role="alert"></p>
+        <div class="row"><button type="submit" value="save">${current === "stripe" ? "Make a new prompt and secret" : "Use Stripe and get my prompt"}</button></div>
+      </form>
+      ${promptFor("stripe")}`;
+  const gatewayPanel = `<form class="grid" data-action="service" data-service="custom_checkout">
+        <input type="hidden" name="kind" value="gateway">
+        <p class="muted">A card-to-crypto processor or exchange behind a payment gateway. The gateway's API key stays in your website's own environment variables; this app doesn't need it.</p>
+        <label>Which gateway<input name="processor" placeholder="Sellix, SellAuth, Komerza…" ${custom?.kind === "gateway" ? `value="${esc(custom.processor ?? "")}"` : ""} required></label>
+        <p class="err" role="alert"></p>
+        <div class="row"><button type="submit" value="save">${current === "gateway" ? "Save and get the new prompt" : "Use this gateway and get my prompt"}</button></div>
+      </form>
+      ${promptFor("gateway")}`;
   return page(
     `${input.brandName} connector`,
     `<div class="row" style="justify-content:space-between"><h1>${esc(input.brandName)} connector</h1>
@@ -184,19 +275,21 @@ export function setupPage(input: SetupInput): string {
 
     <div class="card"><div class="step"><span class="n">2</span><h2>Add it to your website</h2></div>
       <p class="muted">Paste this into Claude Code (or your AI) in your website's project. It's three small changes.</p>
-      <pre id="sitePrompt">${esc(sitePrompt(connectorOrigin))}</pre>
+      <pre id="sitePrompt">${esc(sitePrompt(connectorOrigin, usesCustom))}</pre>
       <div class="row"><button class="ghost" data-copy="sitePrompt" type="button">Copy prompt</button></div>
       ${checks(list, ["website", "media_page", "tracker", "checkout_email"])}
     </div>
 
-    <div class="card"><div class="step"><span class="n">3</span><h2>Connect Shopify</h2></div>
-      <ol>
-        <li>Shopify admin → Settings → Notifications → Webhooks → <strong>Create webhook</strong> four times, format JSON, latest API version, URL:<pre id="hookUrl">${esc(connectorOrigin)}/api/md/shopify/webhook</pre>Events: <strong>Checkout creation</strong>, <strong>Checkout update</strong>, <strong>Order payment</strong>, <strong>Order update</strong>.</li>
-        <li>Shopify admin → Settings → Customer events → <strong>Add custom pixel</strong> → name it "Media Platform", paste this code, set Permission to "Not required", Save, then Connect:<pre id="pixel">${esc(pixelCode(connectorOrigin))}</pre><button class="ghost" data-copy="pixel" type="button">Copy pixel code</button></li>
-        <li>Fill in below.</li>
-      </ol>
-      ${serviceForm(shopify, services.shopify)}
-      ${checks(list, ["shopify", "shopify_pixel"])}
+    <div class="card"><div class="step"><span class="n">3</span><h2>Connect your checkout</h2></div>
+      <p class="muted">What takes your payments? Switched since? Pick the new one: you get a new prompt, and sales already recorded stay.</p>
+      <div class="opts">
+        ${choice("shopify", "Shopify", "Shopify's own checkout")}
+        ${choice("stripe", "Stripe", "Stripe Checkout or Payment Links")}
+        ${choice("gateway", "Non-KYC + gateway", "Card-to-crypto via Komerza, Sellix, SellAuth…")}
+      </div>
+      <div data-panel="shopify" class="grid">${shopifyPanel}</div>
+      <div data-panel="stripe" class="grid">${stripePanel}</div>
+      <div data-panel="gateway" class="grid">${gatewayPanel}</div>
     </div>
 
     <div class="card"><div class="step"><span class="n">4</span><h2>Optional services</h2></div>

@@ -45,6 +45,17 @@ export const APP_SERVICES: AppService[] = [
     ],
   },
   {
+    id: "custom_checkout",
+    name: "Stripe, or a non-KYC processor + gateway",
+    summary: "Stripe, or a card-to-crypto processor behind a gateway (Komerza, Sellix, SellAuth…), reporting paid orders to this app.",
+    howTo: [],
+    optional: false,
+    fields: [
+      field({ name: "kind", label: "Checkout type", pattern: /^(stripe|gateway)$/, error: "Pick Stripe or a gateway." }),
+      field({ name: "processor", label: "Which gateway", placeholder: "Sellix, SellAuth, Komerza…", pattern: /^[^<>\n]{2,80}$/, error: "Type the gateway's name." }),
+    ],
+  },
+  {
     id: "resend",
     name: "Resend (cart-recovery emails)",
     summary: "Emails shoppers who didn't pay, from your own address.",

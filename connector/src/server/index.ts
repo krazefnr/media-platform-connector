@@ -86,4 +86,4 @@ export type * from "./types.js";
 export { createConnectorApp } from "./app.js";
 export type { ConnectorApp, ConnectorAppOptions } from "./app.js";
 export { APP_SERVICES } from "./app-services.js";
-export { sitePrompt, updatePrompt } from "./setup-page.js";
+export { checkoutPrompt, sitePrompt, updatePrompt } from "./setup-page.js";

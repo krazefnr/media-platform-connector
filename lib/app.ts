@@ -48,8 +48,9 @@ function dbProblem(error: unknown): Response {
 /** One app per server instance: its own database pool, built from this project's environment variables. */
 export function getApp(): ConnectorApp {
   if (app) return app;
-  // SUPABASE_DB_URL by hand, or POSTGRES_URL from Supabase's Vercel integration (its transaction pooler address).
-  const url = (process.env.SUPABASE_DB_URL || process.env.POSTGRES_URL)?.trim();
+  // SUPABASE_DB_URL by hand, or POSTGRES_URL from Supabase's Vercel integration (its transaction pooler address), with or without the prefix it was given (e.g. STORAGE_POSTGRES_URL).
+  const prefixed = Object.keys(process.env).find((k) => /^[A-Z0-9_]+_POSTGRES_URL$/.test(k));
+  const url = (process.env.SUPABASE_DB_URL || process.env.POSTGRES_URL || (prefixed && process.env[prefixed]))?.trim();
   const problem = checkUrl(url);
   if (problem) return { handle: async () => problem.clone() };
   const parsed = new URL(url!);
@@ -76,9 +77,17 @@ export function getApp(): ConnectorApp {
       if (!reachable) {
         try {
           await pool.query("select 1");
+        } catch (error) {
+          console.error("[connector] database", error);
+          return dbProblem(error);
+        }
+        try {
+          await ensureSchema(pool);
           reachable = true;
         } catch (error) {
-          return dbProblem(error);
+          console.error("[connector] creating tables", error);
+          const why = error instanceof Error ? error.message : String(error);
+          return page("Couldn't create this app's tables", `<p>Your Supabase answered: <code>${why.replace(/[<>&]/g, "")}</code></p><p>Send a screenshot of this page to the Media Platform.</p>`);
         }
       }
       return inner.handle(request);

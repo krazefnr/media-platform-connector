@@ -236,3 +236,75 @@ test("the app makes its own key once and keeps it", async () => {
   const again = await (await second.handle(new Request(`${CONNECTOR}/api/md/health`))).json();
   assert.equal((first as { app_id: string }).app_id, (again as { app_id: string }).app_id, "a second server instance uses the same key");
 });
+
+test("a brand without Shopify connects any processor, and switching processor swaps the secret but keeps the sales", async () => {
+  const w = world();
+  const app = w.app();
+  const ownerCookie = cookieOf(
+    await app.handle(new Request(`${CONNECTOR}/api/md/owner/unlock`, { method: "POST", headers: { "content-type": "application/json", origin: CONNECTOR }, body: JSON.stringify({ key: OWNER_KEY }) }))
+  );
+  const ownerPost = (path: string, body: unknown) =>
+    app.handle(new Request(`${CONNECTOR}${path}`, { method: "POST", headers: { "content-type": "application/json", origin: CONNECTOR, cookie: ownerCookie }, body: JSON.stringify(body) }));
+  const secretOf = async () => ((await w.store.getSetting("svc:custom_checkout")) as Record<string, string>).secret!;
+
+  assert.equal((await ownerPost("/setup/service", { service: "custom_checkout", values: { kind: "stripe", processor: "Stripe" } })).status, 200);
+  const secret = await secretOf();
+  assert.match(secret, /^mdcs_/);
+  const page = await (await app.handle(new Request(`${CONNECTOR}/`, { headers: { cookie: ownerCookie } }))).text();
+  assert.match(page, /Connect your checkout/);
+  assert.match(page, /Our payments go through Stripe/);
+  assert.match(page, /value="gateway"/, "all three checkout options are offered");
+  assert.match(page, /\/api\/md\/checkout\/event/);
+  assert.ok(page.includes(secret), "the owner's own page shows the secret for their AI prompt");
+  assert.match(page, /checkoutStarted\(\{ email, cartId, total, currency, recoveryUrl \}\)/, "the website prompt switches to the non-Shopify email step");
+
+  // The shopper comes through a creator link and types their email on the brand's site.
+  const local = new Map<string, string>();
+  const site = async (path: string, init: RequestInit = {}) => {
+    const r = await w.viaSite(
+      new Request(`${SITE}${path}`, { ...init, headers: { origin: SITE, cookie: [...local].map(([k, v]) => `${k}=${v}`).join("; "), ...(init.headers as Record<string, string>) } })
+    );
+    const c = cookieOf(r);
+    if (c.includes("=")) local.set(c.slice(0, c.indexOf("=")), c.slice(c.indexOf("=") + 1));
+    return r;
+  };
+  await site("/api/md/click", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ref: "ANNA10" }) });
+  const started = await site("/api/md/checkout-started", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "Sam@Example.com", cart_id: "cart_abc123", total: "60.00", currency: "GBP", recovery_url: `${SITE}/cart?c=abc123` }),
+  });
+  assert.equal(started.status, 200);
+  const watch = await w.store.getCheckoutWatch("cart_abc123");
+  assert.equal(watch?.email, "sam@example.com");
+  assert.equal(watch?.code, "ANNA10");
+
+  const event = (body: unknown, key = secret) => {
+    const raw = JSON.stringify(body);
+    return app.handle(
+      new Request(`${CONNECTOR}/api/md/checkout/event`, { method: "POST", headers: { "content-type": "application/json", "x-md-signature": createHmac("sha256", key).update(raw).digest("hex") }, body: raw })
+    );
+  };
+  const paid = { type: "paid", order_id: "pi_1", checkout_id: "cart_abc123", amount: 60, currency: "GBP", email: "sam@example.com" };
+  assert.equal((await event(paid, "wrong")).status, 401, "unsigned events are refused");
+  assert.equal((await event(paid)).status, 200);
+  assert.equal((await event(paid)).status, 200, "a retried delivery is fine");
+  assert.equal((await w.store.getOrder("pi_1"))?.code, "ANNA10", "the sale is credited to the creator through the cart id");
+  assert.equal((await w.store.getCheckoutWatch("cart_abc123"))?.status, "completed");
+  assert.equal((await event({ type: "nope" })).status, 400);
+
+  const ticks = await (await app.handle(new Request(`${CONNECTOR}/`, { headers: { cookie: ownerCookie } }))).text();
+  assert.match(ticks, /<li class="ok"><span class="dot">✓<\/span><span><strong>Checkout<\/strong> <span class="muted">Paid orders are arriving from Stripe/);
+  assert.ok(!ticks.includes("Waiting for Shopify"), "Shopify isn't asked for");
+
+  // Re-saving the same processor keeps the secret; a new processor gets a new one and the old secret stops working.
+  await ownerPost("/setup/service", { service: "custom_checkout", values: { kind: "stripe", processor: "Stripe" } });
+  assert.equal(await secretOf(), secret);
+  await ownerPost("/setup/service", { service: "custom_checkout", values: { kind: "gateway", processor: "Sellix" } });
+  const next = await secretOf();
+  assert.notEqual(next, secret);
+  assert.equal((await event({ ...paid, order_id: "pi_2" })).status, 401, "the old processor's secret no longer works");
+  assert.equal((await event({ ...paid, order_id: "tr_2" }, next)).status, 200);
+  assert.ok(await w.store.getOrder("pi_1"), "sales recorded before the switch are kept");
+  assert.match(await (await app.handle(new Request(`${CONNECTOR}/`, { headers: { cookie: ownerCookie } }))).text(), /non-KYC card-to-crypto processor behind the Sellix payment gateway/);
+});
